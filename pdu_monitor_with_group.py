@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QComboBox,
     QLineEdit,
+    QMessageBox,
 )
 from PySide6.QtCore import Qt, QTimer, QThread, Signal
 
@@ -192,6 +193,22 @@ class OutletSetWorker(QThread):
         self.set_done.emit(ok, self._row, self._col, self._on)
 
 
+class AllOffWorker(QThread):
+    """后台依次断开所有在线 PDU 的全部插座。"""
+    finished_all = Signal()
+
+    def __init__(self, rows: List[int]):
+        super().__init__()
+        self._rows = rows  # PDU_ONLINE_ROWS
+
+    def run(self):
+        for row in self._rows:
+            ip = PDU_IPS[row]
+            for outlet_index in range(1, OUTLETS_PER_PDU + 1):
+                set_outlet_on_off(ip, outlet_index, False)
+        self.finished_all.emit()
+
+
 class SnmpFetchWorker(QThread):
     data_ready = Signal()
 
@@ -219,6 +236,7 @@ class PduMonitorWithGroupWindow(QMainWindow):
         self._worker_busy = False
         self._worker = None
         self._set_worker = None
+        self._all_off_worker = None  # 全部断开后台线程
 
         self._group_start_buttons: Dict[str, QPushButton] = {}
 
@@ -246,8 +264,27 @@ class PduMonitorWithGroupWindow(QMainWindow):
         info.setStyleSheet("color: #666; padding: 4px;")
         layout.addWidget(info)
 
-        group = QGroupBox("插座电流 / 功率（可分组开机）")
+        group = QGroupBox("")
         group_layout = QVBoxLayout(group)
+
+        # 同一行：左侧固定大小的“立即刷新”，右侧“全部断开”占满剩余整行
+        top_btn_row = QHBoxLayout()
+        btn_refresh = QPushButton("立即刷新")
+        btn_refresh.setFixedSize(100, 56)
+        btn_refresh.clicked.connect(self._refresh_all)
+        top_btn_row.addWidget(btn_refresh)
+
+        btn_all_off = QPushButton("全部断开")
+        btn_all_off.setMinimumHeight(56)
+        btn_all_off.setStyleSheet(
+            "font-size: 18px; font-weight: bold; background-color: #c44; color: white;"
+            "border: 2px solid #800; border-radius: 6px;"
+        )
+        btn_all_off.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_all_off.clicked.connect(self._on_all_off_clicked)
+        top_btn_row.addWidget(btn_all_off, 1)  # stretch=1 占满剩余
+        group_layout.addLayout(top_btn_row)
+
         self._table = QTableWidget(6, 1 + OUTLETS_PER_PDU)
         self._table.setHorizontalHeaderLabels(
             ["PDU / 总功率"] + [f"插座{i}" for i in range(1, OUTLETS_PER_PDU + 1)]
@@ -413,13 +450,6 @@ class PduMonitorWithGroupWindow(QMainWindow):
         group_layout.addLayout(group_row)
 
         layout.addWidget(group)
-
-        btn_layout = QHBoxLayout()
-        btn_refresh = QPushButton("立即刷新")
-        btn_refresh.clicked.connect(self._refresh_all)
-        btn_layout.addWidget(btn_refresh)
-        btn_layout.addStretch()
-        layout.addLayout(btn_layout)
 
         self._status = QStatusBar()
         self.setStatusBar(self._status)
@@ -607,6 +637,37 @@ class PduMonitorWithGroupWindow(QMainWindow):
         self._set_worker.set_done.connect(self._on_set_done)
         self._set_worker.start()
         self._status.showMessage(f"正在发送 插座{outlet_index} {'开' if on else '关'}…")
+
+    def _on_all_off_clicked(self):
+        """全部断开：先确认，再断开所有在线 PDU 的全部插座。"""
+        if not PDU_ONLINE_ROWS:
+            self._status.showMessage("当前无在线 PDU")
+            return
+        if self._all_off_worker and self._all_off_worker.isRunning():
+            self._status.showMessage("正在执行全部断开，请稍候")
+            return
+        reply = QMessageBox.question(
+            self,
+            "确认全部断开",
+            "确定要断开所有在线 PDU 的全部插座吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        self._all_off_worker = AllOffWorker(list(PDU_ONLINE_ROWS))
+        self._all_off_worker.finished_all.connect(self._on_all_off_done)
+        self._all_off_worker.start()
+        self._status.showMessage("正在断开全部插座…")
+
+    def _on_all_off_done(self):
+        """全部断开后台完成：刷新界面、释放 worker 并弹出完成提示。"""
+        if self._all_off_worker:
+            self._all_off_worker.deleteLater()
+            self._all_off_worker = None
+        self._refresh_all()
+        self._status.showMessage("全部插座已断开")
+        QMessageBox.information(self, "全部断开完成", "全部插座已断开。")
 
     def _group_on_outlet_control(self, row: int, col: int, on: bool):
         """组开机使用的控制：允许同一批内多个插座并行执行，不受 _set_worker 串行限制。"""
