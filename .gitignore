@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+
+# Data / logs
+pcasp_data/
+pdu_data/
+data/
+*.log
+*.csv
+
+# OS / editor
+.DS_Store
+Thumbs.db

@@ -1,0 +1,8 @@
+pyside6>=6.0.0
+pyserial>=3.4
+geopandas>=0.10.0
+matplotlib>=3.3.0
+numpy>=1.19.0
+shapely>=1.7.0
+pysnmp>=4.4.0
+openpyxl>=3.1.0
