@@ -1,0 +1,115 @@
+{
+  "name": "PCASP-100X 粒子探头",
+  "type": "serial",
+  "device_id": "PCASP100X_001",
+  "description": "PCASP-100X：1B01 初始化 / 1B02 取数；直方图为 U32 且需 Byte Swapped；AD→物理量见 SPCASP 数据结构示例.xlsx。现场常用 RS-422 转 USB，串口参数与 RS-232 相同。",
+  "config": {
+    "port": "COM11",
+    "baudrate": 38400,
+    "bytesize": 8,
+    "parity": "N",
+    "stopbits": 1,
+    "timeout": 2
+  },
+  "pcasp": {
+    "channel_count": 30,
+    "adc_threshold": 20,
+    "pump_on_connect": true,
+    "comment": "adc_threshold 与 06SPP 头部 Threshold 对齐；channel_count 对应 1B01 的 Channel Count（10/20/30/40）"
+  },
+  "data_format": {
+    "protocol": "binary",
+    "byte_order": "little",
+    "frame_head": [
+      27
+    ],
+    "description": "命令 1B01 初始化，1B02 取数据；响应 0606 或数据块",
+    "fields": [
+      {
+        "name": "hi_gain_baseline",
+        "type": "uint16",
+        "description": "高增益基线"
+      },
+      {
+        "name": "mid_gain_baseline",
+        "type": "uint16",
+        "description": "中增益基线"
+      },
+      {
+        "name": "low_gain_baseline",
+        "type": "uint16",
+        "description": "低增益基线"
+      },
+      {
+        "name": "sample_flow",
+        "type": "uint16",
+        "unit": "std cm3/s",
+        "description": "采样流量"
+      },
+      {
+        "name": "laser_ref_voltage",
+        "type": "uint16",
+        "description": "激光参考电压"
+      },
+      {
+        "name": "aux_analog_1",
+        "type": "uint16",
+        "description": "辅助模拟通道 1"
+      },
+      {
+        "name": "sheath_flow",
+        "type": "uint16",
+        "unit": "std cm3/s",
+        "description": "鞘流"
+      },
+      {
+        "name": "electronics_temp",
+        "type": "uint16",
+        "unit": "℃",
+        "description": "电子舱温度"
+      },
+      {
+        "name": "bin_counts",
+        "type": "array",
+        "description": "通道计数 10/20/30/40 bins"
+      }
+    ]
+  },
+  "display": {
+    "plot_vars": [
+      "sample_flow",
+      "electronics_temp",
+      "laser_ref_voltage"
+    ],
+    "groups": {
+      "流量": [
+        "sample_flow",
+        "sheath_flow"
+      ],
+      "状态": [
+        "hi_gain_baseline",
+        "mid_gain_baseline",
+        "low_gain_baseline",
+        "laser_ref_voltage",
+        "electronics_temp"
+      ]
+    },
+    "update_interval_ms": 1000
+  },
+  "simulation": {
+    "enabled": true,
+    "interval_ms": 1000,
+    "data_template": {
+      "sample_flow": {
+        "min": 1,
+        "max": 5,
+        "variation": 0.1
+      },
+      "electronics_temp": {
+        "min": 25,
+        "max": 35,
+        "variation": 0.5
+      }
+    }
+  }
+}
