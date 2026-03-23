@@ -48,6 +48,7 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QTabWidget,
     QPlainTextEdit,
+    QRadioButton,
 )
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QFont
@@ -113,7 +114,7 @@ except ImportError:
     encode_tas_temperature_iso_cvi = None
     _ISO_CVI_PROTOCOL_AVAILABLE = False
 DEFAULT_BAUDRATES = ["115200", "38400", "57600", "9600"]
-ISO_CVI_SEND_INTERVAL = 0.5  # 向 CVI/ISO 发送 TAS/温度的间隔（秒）
+ISO_CVI_SEND_INTERVAL = 1.0  # 向 CVI/ISO 发送 TAS/温度的间隔（秒），与系统 1 Hz 采样频率一致
 MAX_PLOT_POINTS = 300
 PLOT_POLL_MS = 1000   # 串口轮询与采集 1 Hz
 SIM_TICK_MS = 1000    # 模拟数据/保存/显示 1 Hz（Grimm 除外：6s 一次，收到即保存）
@@ -472,7 +473,7 @@ def _pcasp_settings_from_raw(raw: Optional[Dict]) -> Dict[str, int]:
         ch = PCASP_NUM_BINS
     return {
         "channel_count": ch,
-        "adc_threshold": int(p.get("adc_threshold", 20)),
+        "adc_threshold": int(p.get("adc_threshold", 90)),
     }
 
 
@@ -503,8 +504,8 @@ def pcasp_send_init(ser, pump_on: bool = True, raw: Optional[Dict] = None) -> bo
         return False
 
 
-def read_pcasp_sample(ser) -> Optional[Dict[str, Any]]:
-    """发送 1B02 取数，读 74/114/154/194 字节，校验后解析（直方图 Byte Swapped + AD->物理量换算）。"""
+def read_pcasp_sample(ser, raw: Optional[Dict] = None) -> Optional[Dict[str, Any]]:
+    """发送 1B02 取数。当前 PCASP 固定 30 bins，回复固定 154 字节。"""
     try:
         if not ser or not ser.is_open:
             return None
@@ -512,11 +513,11 @@ def read_pcasp_sample(ser) -> Optional[Dict[str, Any]]:
         ser.reset_input_buffer()
         ser.write(cmd)
         time.sleep(0.05)
-        # 兼容 10/20/30/40 bins
-        buf = _pcasp_read_exact(ser, 194, timeout_s=1.5)
-        if len(buf) not in (74, 114, 154, 194):
+        bins = PCASP_NUM_BINS  # 固定 30
+        expected_len = PCASP_DATA_REPLY_LEN  # 固定 154
+        buf = _pcasp_read_exact(ser, expected_len, timeout_s=0.35)
+        if len(buf) != expected_len:
             return None
-        bins = {74: 10, 114: 20, 154: 30, 194: 40}[len(buf)]
         out = _pcasp_parse_frame(buf, bins)
         if not out or not out.get("_checksum_ok"):
             return None
@@ -1074,6 +1075,10 @@ class UnifiedCollectorWindow(QMainWindow):
         self._device_checked_vars: Dict[int, set] = {}  # row_index -> set of checked var names
         self._device_plot_data: Dict[int, Dict[str, deque]] = {}  # row_index -> {var: deque(...)}
         self._device_plot_start_time: Dict[int, Optional[float]] = {}  # row_index -> start time
+        # 直方图显示设置（仅对 GRIMM / PCASP 生效）
+        self._current_hist_type: Optional[str] = None  # "grimm" | "pcasp" | None
+        self._hist_x_mode: str = "size"               # "size" | "bins"
+        self._hist_y_mode: str = "linear"            # "linear" | "log"
 
         self._build_ui()
         self._load_devices()
@@ -1289,6 +1294,24 @@ class UnifiedCollectorWindow(QMainWindow):
         main_layout = QVBoxLayout(central)
 
         splitter = QSplitter(Qt.Horizontal)
+        self._main_splitter = splitter
+        # 可见、可拖拽的分隔条（手动调整左/中/右宽度）
+        splitter.setHandleWidth(10)
+        splitter.setChildrenCollapsible(False)
+        splitter.setStyleSheet(
+            """
+            QSplitter::handle:horizontal {
+                background: #c8c8c8;
+                border-left: 1px solid #9e9e9e;
+                border-right: 1px solid #9e9e9e;
+                width: 10px;
+                margin: 2px 0;
+            }
+            QSplitter::handle:horizontal:hover {
+                background: #9e9e9e;
+            }
+            """
+        )
 
         # ---------- 左侧：仪器列表 + 串口设置 + 绘图变量 ----------
         left = QWidget()
@@ -1296,26 +1319,29 @@ class UnifiedCollectorWindow(QMainWindow):
         left_layout.addWidget(QLabel("仪器列表（连接/断开、串口设置可保存到 JSON；勾选「模拟」后点连接为模拟数据）"))
         self._table = QTableWidget(0, 6)
         self._table.setHorizontalHeaderLabels(["设备", "端口", "波特率", "操作", "模拟", "状态"])
-        self._table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self._table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
-        self._table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
-        self._table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
-        self._table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
-        self._table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+        hdr = self._table.horizontalHeader()
+        # 各列都允许鼠标拖拽调宽，保留最小宽度防止过窄
+        hdr.setMinimumSectionSize(36)
+        hdr.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        hdr.setStretchLastSection(False)
+        self._table.setColumnWidth(0, 200)
         self._table.setColumnWidth(1, 72)
         self._table.setColumnWidth(2, 56)
         self._table.setColumnWidth(3, 48)
         self._table.setColumnWidth(4, 36)
+        self._table.setColumnWidth(5, 120)
         self._table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self._table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self._table.itemSelectionChanged.connect(self._on_table_selection_changed)
         left_layout.addWidget(self._table)
+        btn_row = QHBoxLayout()
         refresh_btn = QPushButton("刷新串口列表")
         refresh_btn.clicked.connect(self._refresh_serial_ports)
-        left_layout.addWidget(refresh_btn)
         save_btn = QPushButton("将当前表格中的端口/波特率保存到各设备 JSON")
         save_btn.clicked.connect(self._save_all_configs_to_json)
-        left_layout.addWidget(save_btn)
+        btn_row.addWidget(refresh_btn)
+        btn_row.addWidget(save_btn)
+        left_layout.addLayout(btn_row)
         # 绘图变量（选中设备后下方显示，试验阶段全列 data_format.fields，可垂直滚动）
         self._plot_vars_group = QGroupBox("绘图变量 — 未选设备")
         plot_vars_layout = QVBoxLayout(self._plot_vars_group)
@@ -1391,15 +1417,20 @@ class UnifiedCollectorWindow(QMainWindow):
         center_layout.addWidget(self._center_tabs)
         splitter.addWidget(center)
 
-        # ---------- 右侧：实时数据（txt 显示，如 GPS UTC 字段）；PCASP 时加宽以显示 raw+scaled ----------
+        # ---------- 右侧：实时数据（txt 显示，如 GPS UTC 字段）；PCASP 窄宽 + 横向滚动 ----------
         right = QGroupBox("右侧 — 实时数据")
         self._right_group = right
+        right.setMinimumWidth(180)
         right.setMaximumWidth(280)
         right_layout = QVBoxLayout(right)
         # PCASP 需要右侧 txt 显示 raw + scaled（选中 PCASP 时显示）
         self._right_text = QPlainTextEdit()
         self._right_text.setReadOnly(True)
         self._right_text.setVisible(False)
+        self._right_text.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self._right_text.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        # Monospace + 略小字号，列宽压缩后仍可横向滚动看全行
+        self._right_text.setFont(QFont("Consolas", 8))
         self._right_scroll = QScrollArea()
         self._right_scroll.setWidgetResizable(True)
         self._right_content = QWidget()
@@ -1410,7 +1441,7 @@ class UnifiedCollectorWindow(QMainWindow):
         right_layout.addWidget(self._right_scroll)
         splitter.addWidget(right)
 
-        splitter.setSizes([240, 520, 240])
+        splitter.setSizes([260, 600, 260])
         main_layout.addWidget(splitter)
 
         self._status_bar = QStatusBar()
@@ -1722,15 +1753,25 @@ class UnifiedCollectorWindow(QMainWindow):
             return
         self._pcasp_pump_group.setVisible(False)
         saved_checked = self._device_checked_vars.get(self._selected_row, set())
-        cols = 4
+        # 变量区固定纵向滚动；列数：YGDS 3、AAS 2、CPC3788 2、其它 4
+        self._plot_var_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._plot_var_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._plot_var_container.setMinimumWidth(0)
+        if self._is_ygds(row):
+            cols = 3
+        elif self._is_aas(row):
+            cols = 2
+        elif self._is_cpc3788(row):
+            cols = 2
+        else:
+            cols = 4
         for i, (var_name, display_label) in enumerate(plot_vars_with_label):
             cb = QCheckBox(display_label)
             cb.setChecked(var_name in saved_checked)
             cb.stateChanged.connect(self._on_plot_var_toggled)
-            r, col = i // cols, i % cols
-            layout.addWidget(cb, r, col)
+            rr, col = i // cols, i % cols
+            layout.addWidget(cb, rr, col)
             self._plot_var_checkboxes.append((var_name, cb))
-        # 按行数设置容器最小高度，保证所有 checkbox 都能显示、不被边框裁切
         if plot_vars_with_label:
             rows = (len(plot_vars_with_label) + cols - 1) // cols
             self._plot_var_container.setMinimumHeight(rows * 28 + 44)
@@ -1927,7 +1968,7 @@ class UnifiedCollectorWindow(QMainWindow):
         if self._selected_row >= 0 and self._selected_row < len(self._device_rows):
             row = self._device_rows[self._selected_row]
             if self._is_pcasp(row):
-                self._right_group.setMaximumWidth(440)
+                self._right_group.setMaximumWidth(300)
                 self._right_scroll.setVisible(False)
                 self._right_text.setVisible(True)
                 last = row.get("last_data") or {}
@@ -1968,19 +2009,29 @@ class UnifiedCollectorWindow(QMainWindow):
         for name, lbl in self._right_value_labels.items():
             lbl.setText(str(data.get(name, "--")))
 
+    @staticmethod
+    def _pcasp_fmt_two_col(label: str, value: Any, label_w: int = 14, line_w: int = 32) -> str:
+        """Label left-padded to label_w, value right-aligned; total line width line_w (monospace)."""
+        vs = str(value)
+        if len(label) > label_w:
+            label = label[: label_w - 1] + "."
+        pad = max(1, line_w - label_w)
+        return f"{label:<{label_w}}{vs:>{pad}}"
+
     def _format_pcasp_right_text(self, row: Dict[str, Any], d: Dict[str, Any]) -> str:
-        """右侧 txt：端口/本帧时间 + raw(AD) + scaled(物理量) + bin。"""
+        """PCASP right panel: RAW / SCALED / HISTOGRAM 均为两端对齐，标题各独占一行。ASCII only."""
         bins = int(d.get("_bins") or PCASP_NUM_BINS)
         cfg = row.get("config") or {}
-        port = cfg.get("port", "—")
-        baud = cfg.get("baudrate", "—")
+        port = cfg.get("port", "-")
+        baud = cfg.get("baudrate", "-")
+        # 窄列宽适配右侧约 260–300px；过长行用横向滚动查看
+        lw, tw = 14, 32
         lines = [
-            f"本帧时间: {d.get('_sample_time', '—')}",
-            f"配置串口: {port} @ {baud} baud",
+            self._pcasp_fmt_two_col("sample_time", d.get("_sample_time", "-"), lw, tw),
+            self._pcasp_fmt_two_col("serial", f"{port} @ {baud}", lw, tw),
             "",
+            "RAW (AD counts)",
         ]
-        # raw
-        lines.append("RAW (AD/cts)")
         raw_keys = [
             "hi_gain_baseline", "mid_gain_baseline", "low_gain_baseline",
             "sample_flow", "laser_ref_voltage", "aux_analog_1", "sheath_flow", "electronics_temp",
@@ -1988,33 +2039,207 @@ class UnifiedCollectorWindow(QMainWindow):
         ]
         for k in raw_keys:
             if k in d:
-                lines.append(f"{k}: {d.get(k)}")
+                lines.append(self._pcasp_fmt_two_col(k, d.get(k), lw, tw))
         lines.append("")
-        lines.append("SCALED")
-        scaled_map = {
-            "hi_gain_baseline_scaled": "hi_gain_baseline_V",
-            "mid_gain_baseline_scaled": "mid_gain_baseline_V",
-            "low_gain_baseline_scaled": "low_gain_baseline_V",
-            "sample_flow_scaled": "sample_flow_std_cm3_s",
-            "laser_ref_voltage_scaled": "laser_ref_voltage_V",
-            "aux_analog_1_scaled": "aux_analog_1_V",
-            "sheath_flow_scaled": "sheath_flow_std_cm3_s",
-            "electronics_temp_scaled": "electronics_temp_C",
-        }
-        for src, name in scaled_map.items():
-            if src in d:
-                v = d.get(src)
-                lines.append(f"{name}: {v}")
+        lines.append("SCALED:")
+        scaled_order = [
+            ("hi_gain_baseline_scaled", "hi_V"),
+            ("mid_gain_baseline_scaled", "mid_V"),
+            ("low_gain_baseline_scaled", "low_V"),
+            ("sample_flow_scaled", "flow_std"),
+            ("laser_ref_voltage_scaled", "las_V"),
+            ("aux_analog_1_scaled", "aux_V"),
+            ("sheath_flow_scaled", "sheath_std"),
+            ("electronics_temp_scaled", "T_C"),
+        ]
+        any_scaled = False
+        for src, short in scaled_order:
+            if src not in d:
+                continue
+            v = d.get(src)
+            if isinstance(v, float) and v != v:
+                continue
+            if isinstance(v, float):
+                disp = f"{v:.6g}"
+            else:
+                disp = str(v)
+            lines.append(self._pcasp_fmt_two_col(short, disp, lw, tw))
+            any_scaled = True
+        if not any_scaled:
+            lines.append(self._pcasp_fmt_two_col("(none)", "-", lw, tw))
         lines.append("")
-        lines.append(f"HISTOGRAM bins={bins} (bin01..bin{bins:02d})")
+        lines.append(f"HISTOGRAM bins={bins}")
         for i in range(1, bins + 1):
             key = f"bin{i:02d}"
             if key in d:
-                lines.append(f"{key}: {d.get(key)}")
+                lines.append(self._pcasp_fmt_two_col(key, d.get(key), lw, tw))
         return "\n".join(lines)
 
     def _get_checked_plot_vars(self) -> List[str]:
         return [var for var, cb in self._plot_var_checkboxes if cb.isChecked()]
+
+    def _hist_set_x_mode(self, mode: str) -> None:
+        if mode not in ("size", "bins"):
+            return
+        self._hist_x_mode = mode
+        self._update_histogram_plot()
+
+    def _hist_set_y_mode(self, mode: str) -> None:
+        if mode not in ("linear", "log"):
+            return
+        self._hist_y_mode = mode
+        self._update_histogram_plot()
+
+    def _grimm_channel_edges_um(self) -> List[float]:
+        """GRIMM 1.129：缺少官方通道粒径表时的兜底近似。
+        使用 0.25~32 um 的 logspace 作为通道边界，进而得到中心值与柱宽。
+        """
+        min_um = 0.25
+        max_um = 32.0
+        lo = math.log10(min_um)
+        hi = math.log10(max_um)
+        out: List[float] = []
+        for i in range(NUM_CHANNELS_GRIMM + 1):
+            t = i / NUM_CHANNELS_GRIMM
+            out.append(10 ** (lo + (hi - lo) * t))
+        return out
+
+    def _grimm_channel_centers_and_widths_um(self) -> Tuple[List[float], List[float]]:
+        edges = self._grimm_channel_edges_um()
+        centers = [math.sqrt(edges[i] * edges[i + 1]) for i in range(NUM_CHANNELS_GRIMM)]
+        widths = [edges[i + 1] - edges[i] for i in range(NUM_CHANNELS_GRIMM)]
+        return centers, widths
+
+    def _apply_hist_y_scale(self, ax, max_val: float) -> None:
+        y_mode = self._hist_y_mode
+        if y_mode == "log":
+            ax.set_yscale("log")
+            if max_val <= 0:
+                min_pos = 1e-3
+                ax.set_ylim(min_pos, min_pos * 10)
+            else:
+                min_pos = max(1e-3, max_val * 1e-3)  # 避免 0 值在 log 轴上不可见
+                ax.set_ylim(min_pos, max_val * 1.5)
+        else:
+            ax.set_yscale("linear")
+            ax.set_ylim(0, max_val * 1.05 + 1 if max_val > 0 else 1)
+
+    def _find_active_histogram_frame(self) -> Optional[Dict[str, Any]]:
+        if self._selected_row < 0 or self._selected_row >= len(self._device_rows):
+            return None
+        if not self._current_hist_type:
+            return None
+        if self._current_hist_type == "grimm":
+            for f in self._plot_frames:
+                if f.get("grimm_histogram"):
+                    return f
+        if self._current_hist_type == "pcasp":
+            for f in self._plot_frames:
+                if f.get("pcasp_histogram"):
+                    return f
+        return None
+
+    def _update_histogram_plot(self) -> None:
+        frame = self._find_active_histogram_frame()
+        if not frame:
+            return
+        row = self._device_rows[self._selected_row]
+        if frame.get("grimm_histogram"):
+            self._draw_grimm_histogram(frame, row)
+        elif frame.get("pcasp_histogram"):
+            self._draw_pcasp_histogram(frame, row)
+
+    def _draw_grimm_histogram(self, frame: Dict[str, Any], row: Dict[str, Any]) -> None:
+        ax = frame["ax"]
+        canvas = frame["canvas"]
+        ax.clear()
+
+        ld = row.get("last_data") or {}
+        vals = [float(ld.get(f"Ch{i+1}", 0)) for i in range(NUM_CHANNELS_GRIMM)]
+        max_val = max(vals) if vals else 1.0
+
+        x_mode = self._hist_x_mode
+        if x_mode == "bins":
+            x = list(range(1, NUM_CHANNELS_GRIMM + 1))
+            width = 0.8
+            ax.set_xlabel("Bins / Channel")
+            ax.set_xticks(x)
+            ax.set_xlim(0.5, NUM_CHANNELS_GRIMM + 0.5)
+        else:
+            centers, widths = self._grimm_channel_centers_and_widths_um()
+            x = centers
+            width = widths
+            ax.set_xlabel("Size (um)")
+            # logspace 下的柱宽差异较大，x 轴采用少量固定刻度即可
+            ticks = [0.25, 0.5, 1, 2, 4, 8, 16, 32]
+            ax.set_xticks([t for t in ticks if t >= min(x) and t <= max(x)])
+            ax.set_xlim(min(x) * 0.98, max(x) * 1.02)
+
+        ax.set_ylabel("Count")
+        if x_mode == "size":
+            ax.set_title("GRIMM 32-channel histogram (size, approx)")
+        else:
+            ax.set_title("GRIMM 32-channel histogram (bins/channel)")
+
+        bars = ax.bar(
+            x,
+            vals,
+            width=width,
+            color="#1f77b4",
+            edgecolor="#333",
+            linewidth=0.5,
+        )
+
+        self._apply_hist_y_scale(ax, max_val)
+        ax.grid(True, alpha=0.25, axis="y")
+        frame["bars"] = list(bars)
+        frame["y_mode"] = self._hist_y_mode
+        frame["x_mode"] = self._hist_x_mode
+        canvas.draw_idle()
+
+    def _draw_pcasp_histogram(self, frame: Dict[str, Any], row: Dict[str, Any]) -> None:
+        ax = frame["ax"]
+        canvas = frame["canvas"]
+        ax.clear()
+
+        ld = row.get("last_data") or {}
+        nb = int(ld.get("_bins") or frame.get("pcasp_nbins") or PCASP_NUM_BINS)
+        vals = [float(ld.get(f"bin{i:02d}", 0)) for i in range(1, PCASP_NUM_BINS + 1)]
+        max_val = max(vals[:nb]) if nb > 0 else 1.0
+
+        x_mode = self._hist_x_mode
+        if x_mode == "size":
+            x = PCASP_BIN_SIZES_UM
+            width = 0.008
+            ax.set_xlabel("Size (um)")
+            ax.set_xticks(x)
+            ax.set_xlim(-0.05, 3.2)
+        else:
+            x = list(range(1, PCASP_NUM_BINS + 1))
+            width = 0.8
+            ax.set_xlabel("Bins / Bin #")
+            ax.set_xticks(x)
+            ax.set_xlim(0.5, PCASP_NUM_BINS + 0.5)
+
+        ax.set_ylabel("Count")
+        ax.set_title("PCASP Histogram" + (f" ({x_mode})" if x_mode else ""))
+
+        bars = ax.bar(
+            x,
+            vals,
+            width=width,
+            color="#2ca02c",
+            edgecolor="#333",
+            linewidth=0.5,
+        )
+
+        # 更新 y 轴（linear/log）
+        self._apply_hist_y_scale(ax, max_val)
+        ax.grid(True, alpha=0.25, axis="y")
+        frame["bars"] = list(bars)
+        frame["y_mode"] = self._hist_y_mode
+        frame["x_mode"] = self._hist_x_mode
+        canvas.draw_idle()
 
     def _rebuild_center_plots(self) -> None:
         """按当前勾选的变量重建中间区。GRIMM 仅显示 32 通道直方图；其它设备为每变量一幅时序图。"""
@@ -2029,69 +2254,88 @@ class UnifiedCollectorWindow(QMainWindow):
         if self._selected_row >= 0 and self._selected_row < len(self._device_rows):
             row = self._device_rows[self._selected_row]
             if self._is_grimm(row):
+                self._current_hist_type = "grimm"
+                self._hist_x_mode = "bins"
+                self._hist_y_mode = "linear"
                 box = QFrame()
                 box.setFrameStyle(QFrame.Shape.StyledPanel | QFrame.Shadow.Sunken)
                 box_layout = QVBoxLayout(box)
                 box_layout.setContentsMargins(4, 4, 4, 4)
-                box_layout.addWidget(QLabel("GRIMM 32-channel Histogram"))
+                box_layout.addWidget(QLabel("GRIMM 32-channel histogram"))
+                ctrl_layout = QHBoxLayout()
+                ctrl_layout.addWidget(QLabel("X:"))
+                rb_x_size = QRadioButton("size")
+                rb_x_bins = QRadioButton("bins")
+                rb_x_bins.setChecked(True)
+                rb_x_size.toggled.connect(lambda checked, m="size": checked and self._hist_set_x_mode(m))
+                rb_x_bins.toggled.connect(lambda checked, m="bins": checked and self._hist_set_x_mode(m))
+                ctrl_layout.addWidget(rb_x_size)
+                ctrl_layout.addWidget(rb_x_bins)
+                ctrl_layout.addSpacing(10)
+                ctrl_layout.addWidget(QLabel("Y:"))
+                rb_y_linear = QRadioButton("linear")
+                rb_y_log = QRadioButton("log")
+                rb_y_linear.setChecked(True)
+                rb_y_linear.toggled.connect(lambda checked, m="linear": checked and self._hist_set_y_mode(m))
+                rb_y_log.toggled.connect(lambda checked, m="log": checked and self._hist_set_y_mode(m))
+                ctrl_layout.addWidget(rb_y_linear)
+                ctrl_layout.addWidget(rb_y_log)
+                ctrl_layout.addStretch(1)
+                box_layout.addLayout(ctrl_layout)
                 fig = Figure(figsize=(10, 3), dpi=100)
                 ax = fig.add_subplot(111)
-                ax.set_xlabel("Channel")
-                ax.set_ylabel("Count")
-                ax.set_title("GRIMM Channel Histogram")
-                x = list(range(1, NUM_CHANNELS_GRIMM + 1))
-                channels = (row.get("last_data") or {})
-                vals = [float(channels.get(f"Ch{i+1}", 0)) for i in range(NUM_CHANNELS_GRIMM)]
-                bars = ax.bar(x, vals, color="#1f77b4", edgecolor="#333", linewidth=0.5)
-                ax.set_xticks(x)
-                max_val = max(vals) if vals else 1
-                ax.set_ylim(0, max_val * 1.05 + 1 if max_val > 0 else 1)
-                fig.subplots_adjust(left=0.12, right=0.98, top=0.92, bottom=0.14)
+                frame = {"grimm_histogram": True, "widget": box, "fig": fig, "ax": ax, "canvas": None, "bars": None}
                 canvas = FigureCanvas(fig)
+                frame["canvas"] = canvas
+                fig.subplots_adjust(left=0.12, right=0.98, top=0.92, bottom=0.14)
                 box_layout.addWidget(canvas)
                 box.setMinimumHeight(220)
                 layout.addWidget(box)
-                self._plot_frames.append({"grimm_histogram": True, "widget": box, "fig": fig, "canvas": canvas, "ax": ax, "bars": bars})
+                self._plot_frames.append(frame)
+                self._draw_grimm_histogram(frame, row)
                 return
             if self._is_pcasp(row):
+                self._current_hist_type = "pcasp"
+                self._hist_x_mode = "size"
+                self._hist_y_mode = "linear"
                 box = QFrame()
                 box.setFrameStyle(QFrame.Shape.StyledPanel | QFrame.Shadow.Sunken)
                 box_layout = QVBoxLayout(box)
                 box_layout.setContentsMargins(4, 4, 4, 4)
-                box_layout.addWidget(QLabel("PCASP 粒径分布（30 档，横轴 μm）"))
+                box_layout.addWidget(QLabel("PCASP histogram (30 bins, size um)"))
+                ctrl_layout = QHBoxLayout()
+                ctrl_layout.addWidget(QLabel("X:"))
+                rb_x_size = QRadioButton("size")
+                rb_x_bins = QRadioButton("bins")
+                rb_x_size.setChecked(True)
+                rb_x_size.toggled.connect(lambda checked, m="size": checked and self._hist_set_x_mode(m))
+                rb_x_bins.toggled.connect(lambda checked, m="bins": checked and self._hist_set_x_mode(m))
+                ctrl_layout.addWidget(rb_x_size)
+                ctrl_layout.addWidget(rb_x_bins)
+                ctrl_layout.addSpacing(10)
+                ctrl_layout.addWidget(QLabel("Y:"))
+                rb_y_linear = QRadioButton("linear")
+                rb_y_log = QRadioButton("log")
+                rb_y_linear.setChecked(True)
+                rb_y_linear.toggled.connect(lambda checked, m="linear": checked and self._hist_set_y_mode(m))
+                rb_y_log.toggled.connect(lambda checked, m="log": checked and self._hist_set_y_mode(m))
+                ctrl_layout.addWidget(rb_y_linear)
+                ctrl_layout.addWidget(rb_y_log)
+                ctrl_layout.addStretch(1)
+                box_layout.addLayout(ctrl_layout)
                 fig = Figure(figsize=(10, 3.2), dpi=100)
                 ax = fig.add_subplot(111)
-                ax.set_xlabel("粒径 (μm)")
-                ax.set_ylabel("计数")
-                ax.set_title("PCASP Histogram")
-                ld = (row.get("last_data") or {})
-                vals = [float(ld.get(f"bin{i:02d}", 0)) for i in range(1, PCASP_NUM_BINS + 1)]
-                bars = ax.bar(
-                    PCASP_BIN_SIZES_UM,
-                    vals,
-                    width=0.008,
-                    color="#2ca02c",
-                    edgecolor="#333",
-                    linewidth=0.5,
-                )
-                ax.set_xlim(-0.05, 3.2)
-                max_val = max(vals) if vals else 1
-                ax.set_ylim(0, max_val * 1.05 + 1 if max_val > 0 else 1)
-                fig.subplots_adjust(left=0.10, right=0.98, top=0.90, bottom=0.18)
+                frame = {"pcasp_histogram": True, "widget": box, "fig": fig, "ax": ax, "canvas": None, "bars": None, "pcasp_nbins": PCASP_NUM_BINS}
                 canvas = FigureCanvas(fig)
+                frame["canvas"] = canvas
+                fig.subplots_adjust(left=0.10, right=0.98, top=0.90, bottom=0.18)
                 box_layout.addWidget(canvas)
                 box.setMinimumHeight(240)
                 layout.addWidget(box)
-                self._plot_frames.append({
-                    "pcasp_histogram": True,
-                    "widget": box,
-                    "fig": fig,
-                    "canvas": canvas,
-                    "ax": ax,
-                    "bars": bars,
-                    "pcasp_nbins": PCASP_NUM_BINS,
-                })
+                self._plot_frames.append(frame)
+                self._draw_pcasp_histogram(frame, row)
                 return
+            self._current_hist_type = None
         checked = self._get_checked_plot_vars()
         for var in checked:
             box = QFrame()
@@ -2132,6 +2376,12 @@ class UnifiedCollectorWindow(QMainWindow):
         did = (raw.get("device_id") or "").upper()
         path = (row.get("config_path") or "").lower()
         return "YGDS" in did or "ygds" in path
+
+    def _is_aas(self, row: Dict) -> bool:
+        raw = row.get("raw") or {}
+        did = (raw.get("device_id") or "").upper()
+        path = (row.get("config_path") or "").lower()
+        return did.startswith("AAS") or "aas" in path
 
     def _is_nox_o3(self, row: Dict) -> bool:
         raw = row.get("raw") or {}
@@ -2298,7 +2548,7 @@ class UnifiedCollectorWindow(QMainWindow):
                 row["_nox_read_buffer"] = buf
                 continue
             if self._is_pcasp(row):
-                sample = read_pcasp_sample(ser)
+                sample = read_pcasp_sample(ser, row.get("raw"))
                 if sample:
                     row["last_data"] = sample
                     self._append_device_csv(row_index, row)
@@ -2378,10 +2628,8 @@ class UnifiedCollectorWindow(QMainWindow):
                     for i, bar in enumerate(bars):
                         bar.set_height(vals[i] if i < len(vals) else 0)
                     ax = frame["ax"]
-                    ax.relim()
-                    ax.autoscale_view(scalex=False)
                     max_val = max(vals) if vals else 1
-                    ax.set_ylim(0, max_val * 1.05 + 1 if max_val > 0 else 1)
+                    self._apply_hist_y_scale(ax, max_val)
                 canvas.draw_idle()
                 continue
             if frame.get("pcasp_histogram"):
@@ -2400,9 +2648,7 @@ class UnifiedCollectorWindow(QMainWindow):
                         bar.set_height(h)
                         max_h = max(max_h, h)
                     ax = frame["ax"]
-                    ax.relim()
-                    ax.autoscale_view(scalex=False)
-                    ax.set_ylim(0, max_h * 1.05 + 1 if max_h > 0 else 1)
+                    self._apply_hist_y_scale(ax, max_h)
                 canvas.draw_idle()
                 continue
             var = frame["var"]

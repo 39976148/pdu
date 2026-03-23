@@ -13,9 +13,9 @@
   },
   "pcasp": {
     "channel_count": 30,
-    "adc_threshold": 20,
+    "adc_threshold": 90,
     "pump_on_connect": true,
-    "comment": "adc_threshold 与 06SPP 头部 Threshold 对齐；channel_count 对应 1B01 的 Channel Count（10/20/30/40）"
+    "comment": "adc_threshold 对齐 SPCASP 初始化示例(90)；channel_count 对应 1B01 的 Channel Count（10/20/30/40）"
   },
   "data_format": {
     "protocol": "binary",

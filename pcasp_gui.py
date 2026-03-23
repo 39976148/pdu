@@ -234,7 +234,7 @@ class PcaspGui(tk.Tk):
         self.port_var = tk.StringVar(value="COM11")
         self.baud_var = tk.IntVar(value=38400)
         self.bins_var = tk.IntVar(value=30)
-        self.thr_var = tk.IntVar(value=20)
+        self.thr_var = tk.IntVar(value=90)
         self.pump_var = tk.BooleanVar(value=True)
         self.interval_var = tk.DoubleVar(value=1.0)
         self.timeout_var = tk.DoubleVar(value=1.5)
