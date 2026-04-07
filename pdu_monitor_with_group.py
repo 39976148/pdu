@@ -478,6 +478,11 @@ class PduMonitorWithGroupWindow(QMainWindow):
         self._poll_timer.start(PDU_POLL_MS)
         self._refresh_all()
 
+        # CSV 定时写入：与 SNMP 刷新解耦，保证 1s 一个 record（写入的是“最近一次已知快照”）
+        self._csv_timer = QTimer(self)
+        self._csv_timer.timeout.connect(self._save_csv_auto)
+        self._csv_timer.start(1000)
+
     def _build_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
@@ -898,7 +903,8 @@ class PduMonitorWithGroupWindow(QMainWindow):
         """按刷新间隔自动向本次运行的 CSV 文件追加一行。"""
         path = self._append_csv_row()
         if path:
-            self._status.showMessage(f"已自动保存 CSV（每 1 秒）: {os.path.basename(path)}")
+            # 不刷屏状态栏（避免与控制/刷新提示互相覆盖）
+            pass
 
     def _save_data_to_files(self):
         """向本次运行的 CSV 追加一行，并写入带时间戳的别名 JSON 到 pdu_data 目录。"""
@@ -1059,7 +1065,6 @@ class PduMonitorWithGroupWindow(QMainWindow):
                 dead = [(None, None, None)] * OUTLETS_PER_PDU
                 self._apply_row_data(row, dead, "-", is_online=False)
             self._update_top_info_banner()
-            self._save_csv_auto()
             return
         for row, data in data_by_row.items():
             if row >= n_rows or len(data) != OUTLETS_PER_PDU:
@@ -1073,7 +1078,7 @@ class PduMonitorWithGroupWindow(QMainWindow):
             total_str = f"{int(round(total_power))}W" if has_valid else "-"
             self._apply_row_data(row, data, total_str, is_online=has_valid)
         self._update_top_info_banner()
-        self._save_csv_auto()
+        # CSV 由独立 1s 定时器写入最近快照
 
     def _refresh_all(self):
         for row, ip in enumerate(PDU_IPS):
