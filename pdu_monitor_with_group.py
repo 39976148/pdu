@@ -483,6 +483,29 @@ class PduMonitorWithGroupWindow(QMainWindow):
         self._csv_timer.timeout.connect(self._save_csv_auto)
         self._csv_timer.start(1000)
 
+    def _update_total_power_header(self) -> None:
+        """更新表头第 0 列：显示 6 个 PDU 的总功率合计。"""
+        try:
+            n_rows = min(6, len(PDU_IPS))
+            total_sum = 0.0
+            has_any = False
+            for r in range(n_rows):
+                if r not in self._online_rows_runtime:
+                    continue
+                data = self._last_data_by_row.get(r)
+                if not isinstance(data, list) or len(data) != OUTLETS_PER_PDU:
+                    continue
+                total_sum += float(sum((p or 0.0) for _, p, _ in data))
+                has_any = True
+            label = "PDU / 总功率"
+            if has_any:
+                label = f"PDU / 总功率（合计 {int(round(total_sum))}W）"
+            self._table.setHorizontalHeaderLabels(
+                [label] + [f"插座{i}" for i in range(1, OUTLETS_PER_PDU + 1)]
+            )
+        except Exception:
+            pass
+
     def _build_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
@@ -1065,6 +1088,7 @@ class PduMonitorWithGroupWindow(QMainWindow):
                 dead = [(None, None, None)] * OUTLETS_PER_PDU
                 self._apply_row_data(row, dead, "-", is_online=False)
             self._update_top_info_banner()
+            self._update_total_power_header()
             return
         for row, data in data_by_row.items():
             if row >= n_rows or len(data) != OUTLETS_PER_PDU:
@@ -1078,6 +1102,7 @@ class PduMonitorWithGroupWindow(QMainWindow):
             total_str = f"{int(round(total_power))}W" if has_valid else "-"
             self._apply_row_data(row, data, total_str, is_online=has_valid)
         self._update_top_info_banner()
+        self._update_total_power_header()
         # CSV 由独立 1s 定时器写入最近快照
 
     def _refresh_all(self):
